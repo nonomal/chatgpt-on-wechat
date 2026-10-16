@@ -8,6 +8,11 @@ import requests
 from config import conf
 from translate.translator import Translator
 
+# 10s per attempt, the same bound the Youdao translator uses. requests would
+# otherwise wait forever, and this call is retried up to three times, so a
+# stalled connection could block the caller indefinitely.
+REQUEST_TIMEOUT = 10
+
 
 class BaiduTranslator(Translator):
     def __init__(self) -> None:
@@ -31,8 +36,16 @@ class BaiduTranslator(Translator):
 
         retry_cnt = 3
         while retry_cnt:
-            r = requests.post(self.url, params=payload, headers=headers)
-            result = r.json()
+            r = requests.post(self.url, params=payload, headers=headers, timeout=REQUEST_TIMEOUT)
+            try:
+                result = r.json()
+            except ValueError:
+                # An HTTP-level failure carries no error_code to inspect — a
+                # proxy in front of the API answers with an HTML body, for
+                # instance. Report the status and the body instead of letting a
+                # decode error take over, which is what the Youdao translator's
+                # raise_for_status() achieves for the sibling implementation.
+                raise Exception(f"baidu translate HTTP {r.status_code}: {r.text[:200]}")
             errcode = result.get("error_code", "52000")
             if errcode != "52000":
                 if errcode == "52001" or errcode == "52002":
@@ -42,6 +55,11 @@ class BaiduTranslator(Translator):
                     raise Exception(result["error_msg"])
             else:
                 break
+        if retry_cnt == 0:
+            # every attempt hit a transient error (52001/52002), so the last
+            # response carries no trans_result: report the api error instead of
+            # letting the join below fail with a bare KeyError
+            raise Exception(result["error_msg"])
         text = "\n".join([item["dst"] for item in result["trans_result"]])
         return text
 
